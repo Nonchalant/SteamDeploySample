@@ -1,0 +1,105 @@
+name: Upload to Steam
+
+# 1. 毎週月曜日の11時に定期実行
+# 2. GitHub上での手動実行
+on:
+  # schedule:
+  #   - cron: '0 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      environment: # デプロイ先の指定
+        type: choice
+        required: true
+        default: "debug"
+        options:
+          - "debug"
+          - "prerelease"
+          - "default"
+        description: Deployment environment
+
+# 複数のアップロードフローが発火している際に古いフローをキャンセル
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+    
+jobs:
+  build: # Unity製アプリのビルドフロー
+    runs-on: ubuntu-latest
+    outputs:
+      buildVersion: ${{ steps.buildStep.outputs.buildVersion }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Create LFS file list
+        run: git lfs ls-files -l | cut -d' ' -f1 | sort > .lfs-assets-id
+        
+      - name: Restore LFS cache
+        uses: actions/cache@v3
+        id: lfs-cache
+        with:
+          path: .git/lfs
+          key: ${{ runner.os }}-lfs-${{ hashFiles('.lfs-assets-id') }}
+          
+      - name: Git LFS Pull
+        run: |
+          git lfs pull
+          git add .
+          git reset --hard
+
+      - name: Set Build Version
+        id: buildStep
+        run: echo "buildVersion=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      
+      - uses: actions/cache@v3
+        with:
+          path: Library
+          key: Library-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            Library-
+          
+      # Windows 64bit向けのビルド
+      - name: Run the Windows build
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+        with:
+          targetPlatform: StandaloneWindows64
+          unityVersion: 2022.3.50f1 # 手元のUnity Versionに置き換える
+          versioning: Semantic
+          
+      # デプロイフローで参照できるようにGitHub Actions上にアップロード
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build-${{ steps.buildStep.outputs.buildVersion }}
+          path: build
+  
+  deploy: # Steamへのデプロイフロー
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      # ビルドフローでアップロードした生成物をダウンロード
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Build-${{ needs.build.outputs.buildVersion }}
+          
+      # Secretsに登録されているSteamの認証情報を用いてSteamへデプロイ
+      - uses: game-ci/steam-deploy@v3
+        with:
+          username: ${{ secrets.STEAM_USERNAME }}
+          configVdf: ${{ secrets.STEAM_CONFIG_VDF }}
+          appId: ${{ secrets.STEAM_APP_ID }}
+          buildDescription: v${{ needs.build.outputs.buildVersion }}
+          rootPath: StandaloneWindows64
+          depot1Path: .
+          depot1InstallScriptPath: ./install_script.vdf
+          releaseBranch: ${{ github.event.inputs.environment }} # デプロイ先
